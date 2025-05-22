@@ -8,6 +8,24 @@ const components: Partial<Components> = {
   // @ts-expect-error
   code: CodeBlock,
   pre: ({ children }) => <>{children}</>,
+  // Prevent p tags from wrapping elements that can't be inside p tags
+  p: ({ node, children, ...props }) => {
+    // Check if children contain elements that can't be nested in p
+    const hasInvalidChildren = React.Children.toArray(children).some(
+      (child) => 
+        React.isValidElement(child) && 
+        (child.type === 'pre' || 
+         (child.props && child.props.node && 
+          (child.props.node.tagName === 'pre' || child.props.node.tagName === 'div')))
+    );
+    
+    // If there are invalid children, use a div instead of p
+    return hasInvalidChildren ? (
+      <div {...props}>{children}</div>
+    ) : (
+      <p {...props}>{children}</p>
+    );
+  },
   ol: ({ node, children, ...props }) => {
     return (
       <ol className="list-decimal list-outside ml-4" {...props}>

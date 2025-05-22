@@ -66,9 +66,15 @@ export async function POST(request: Request) {
 
   try {
     const json = await request.json();
-    requestBody = postRequestBodySchema.parse(json);
-  } catch (_) {
-    return new ChatSDKError('bad_request:api').toResponse();
+    try {
+      requestBody = postRequestBodySchema.parse(json);
+    } catch (parseError) {
+      console.error('Schema validation error:', parseError);
+      return new ChatSDKError('bad_request:api', 'Invalid request format').toResponse();
+    }
+  } catch (jsonError) {
+    console.error('JSON parsing error:', jsonError);
+    return new ChatSDKError('bad_request:api', 'Invalid JSON').toResponse();
   }
 
   try {
@@ -237,6 +243,12 @@ export async function POST(request: Request) {
     if (error instanceof ChatSDKError) {
       return error.toResponse();
     }
+    
+    // Return a generic error response if not a ChatSDKError
+    return new Response(JSON.stringify({ error: 'An unexpected error occurred' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
   }
 }
 
