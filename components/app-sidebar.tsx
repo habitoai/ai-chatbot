@@ -17,10 +17,13 @@ import {
 } from '@/components/ui/sidebar';
 import Link from 'next/link';
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip';
+import { SyncStatus } from './sync-status';
+import { useLocalStorageContext } from './local-storage-context';
 
 export function AppSidebar({ user }: { user: User | undefined }) {
   const router = useRouter();
   const { setOpenMobile } = useSidebar();
+  const { isOnline } = useLocalStorageContext();
 
   return (
     <Sidebar className="group-data-[side=left]:border-r-0">
@@ -61,7 +64,15 @@ export function AppSidebar({ user }: { user: User | undefined }) {
       <SidebarContent>
         <SidebarHistory user={user} />
       </SidebarContent>
-      <SidebarFooter>{user && <SidebarUserNav user={user} />}</SidebarFooter>
+      <SidebarFooter>
+        <div className="flex flex-col gap-2">
+          {/* Add sync status indicator */}
+          <div className="px-2">
+            <SyncStatus />
+          </div>
+          {user && <SidebarUserNav user={user} />}
+        </div>
+      </SidebarFooter>
     </Sidebar>
   );
 }

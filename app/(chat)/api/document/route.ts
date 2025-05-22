@@ -6,6 +6,8 @@ import {
   saveDocument,
 } from '@/lib/db/queries';
 import { ChatSDKError } from '@/lib/errors';
+// Import client-side document functions for the response metadata
+import * as clientDocs from '@/lib/db/client/documents';
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -24,19 +26,45 @@ export async function GET(request: Request) {
     return new ChatSDKError('unauthorized:document').toResponse();
   }
 
-  const documents = await getDocumentsById({ id });
+  try {
+    // Special case for 'init' document ID which is used for initialization
+    if (id === 'init') {
+      return Response.json({ 
+        error: 'Initialization document not found',
+        checkLocalStorage: true,
+        documentId: id
+      }, { status: 404 });
+    }
+    
+    // Try to get documents from the server database
+    const documents = await getDocumentsById({ id });
+    const [document] = documents;
 
-  const [document] = documents;
+    if (!document) {
+      // If not found on server, return a special response indicating
+      // that the client should check local storage
+      return Response.json({ 
+        error: 'Document not found in server database',
+        checkLocalStorage: true,
+        documentId: id
+      }, { status: 404 });
+    }
 
-  if (!document) {
-    return new ChatSDKError('not_found:document').toResponse();
+    if (document.userId !== session.user.id) {
+      return new ChatSDKError('forbidden:document').toResponse();
+    }
+
+    return Response.json(documents, { status: 200 });
+  } catch (error) {
+    console.error('Error retrieving document:', error);
+    
+    // Return a response indicating to check local storage
+    return Response.json({ 
+      error: 'Error retrieving document from server',
+      checkLocalStorage: true,
+      documentId: id
+    }, { status: 500 });
   }
-
-  if (document.userId !== session.user.id) {
-    return new ChatSDKError('forbidden:document').toResponse();
-  }
-
-  return Response.json(documents, { status: 200 });
 }
 
 export async function POST(request: Request) {

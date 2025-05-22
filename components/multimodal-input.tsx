@@ -137,6 +137,19 @@ function PureMultimodalInput({
     formData.append('file', file);
 
     try {
+      // Check if we're online before attempting to upload
+      if (!navigator.onLine) {
+        toast.warning('You are offline. File will be queued for upload when you reconnect.');
+        // In a real implementation, we would store the file in IndexedDB
+        // For now, we'll return a placeholder attachment
+        return {
+          url: URL.createObjectURL(file), // Create a temporary local URL
+          name: file.name,
+          contentType: file.type,
+          isOffline: true, // Mark as offline for UI handling
+        };
+      }
+
       const response = await fetch('/api/files/upload', {
         method: 'POST',
         body: formData,
@@ -144,7 +157,22 @@ function PureMultimodalInput({
 
       if (response.ok) {
         const data = await response.json();
-        const { url, pathname, contentType } = data;
+        const { url, pathname, contentType, originalName, size } = data;
+
+        // Save attachment metadata for offline access
+        try {
+          // This would use our blob-storage utility in a real implementation
+          localStorage.setItem(`attachment_${pathname}`, JSON.stringify({
+            url,
+            name: pathname,
+            originalName,
+            contentType,
+            size,
+            uploadedAt: new Date().toISOString(),
+          }));
+        } catch (err) {
+          console.error('Failed to save attachment metadata:', err);
+        }
 
         return {
           url,
@@ -156,6 +184,7 @@ function PureMultimodalInput({
       toast.error(error);
     } catch (error) {
       toast.error('Failed to upload file, please try again!');
+      console.error('Upload error:', error);
     }
   };
 

@@ -1,6 +1,7 @@
 import { put } from '@vercel/blob';
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
+import { generateUUID } from '@/lib/utils';
 
 import { auth } from '@/app/(auth)/auth';
 
@@ -8,12 +9,27 @@ import { auth } from '@/app/(auth)/auth';
 const FileSchema = z.object({
   file: z
     .instanceof(Blob)
-    .refine((file) => file.size <= 5 * 1024 * 1024, {
-      message: 'File size should be less than 5MB',
+    .refine((file) => file.size <= 20 * 1024 * 1024, {
+      message: 'File size should be less than 20MB',
     })
-    // Update the file type based on the kind of files you want to accept
-    .refine((file) => ['image/jpeg', 'image/png'].includes(file.type), {
-      message: 'File type should be JPEG or PNG',
+    // Support a wider range of file types as specified in the PRD
+    .refine((file) => [
+      // Images
+      'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml',
+      // Documents
+      'application/pdf', 'text/plain', 'text/markdown', 'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.ms-excel',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/vnd.ms-powerpoint',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      // Code files
+      'text/javascript', 'application/json', 'text/html', 'text/css',
+      'application/x-python-code', 'text/x-python', 'text/x-typescript',
+      // Other
+      'application/zip', 'application/x-zip-compressed'
+    ].includes(file.type), {
+      message: 'Unsupported file type. Please upload an image, document, code file, or zip archive.',
     }),
 });
 
@@ -47,17 +63,39 @@ export async function POST(request: Request) {
     }
 
     // Get filename from formData since Blob doesn't have name property
-    const filename = (formData.get('file') as File).name;
+    const originalFilename = (formData.get('file') as File).name;
+    
+    // Generate a unique filename to prevent conflicts
+    const uniqueId = generateUUID().slice(0, 8);
+    const fileExtension = originalFilename.split('.').pop() || '';
+    const filename = fileExtension
+      ? `${uniqueId}-${Date.now()}.${fileExtension}`
+      : `${uniqueId}-${Date.now()}`;
+    
     const fileBuffer = await file.arrayBuffer();
 
     try {
-      const data = await put(`${filename}`, fileBuffer, {
+      // Upload to Vercel Blob with the unique filename
+      const data = await put(filename, fileBuffer, {
         access: 'public',
+        contentType: file.type,
+        addRandomSuffix: false, // We're already adding our own unique ID
       });
 
-      return NextResponse.json(data);
+      // Return enhanced response with additional metadata
+      return NextResponse.json({
+        ...data,
+        originalName: originalFilename,
+        size: file.size,
+        uploadedAt: new Date().toISOString(),
+        userId: session.user?.id,
+      });
     } catch (error) {
-      return NextResponse.json({ error: 'Upload failed' }, { status: 500 });
+      console.error('Vercel Blob upload error:', error);
+      return NextResponse.json({ 
+        error: 'Upload failed', 
+        details: error instanceof Error ? error.message : 'Unknown error' 
+      }, { status: 500 });
     }
   } catch (error) {
     return NextResponse.json(

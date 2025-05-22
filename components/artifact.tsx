@@ -9,7 +9,7 @@ import {
   useEffect,
   useState,
 } from 'react';
-import useSWR, { useSWRConfig } from 'swr';
+import { useQuery, useQueryClient, useMutation } from '@tanstack/react-query';
 import { useDebounceCallback, useWindowSize } from 'usehooks-ts';
 import type { Document, Vote } from '@/lib/db/schema';
 import { fetcher } from '@/lib/utils';
@@ -87,16 +87,16 @@ function PureArtifact({
 }) {
   const { artifact, setArtifact, metadata, setMetadata } = useArtifact();
 
+  const documentsQueryKey = [`/api/document?id=${artifact.documentId}`];
   const {
     data: documents,
     isLoading: isDocumentsFetching,
-    mutate: mutateDocuments,
-  } = useSWR<Array<Document>>(
-    artifact.documentId !== 'init' && artifact.status !== 'streaming'
-      ? `/api/document?id=${artifact.documentId}`
-      : null,
-    fetcher,
-  );
+    refetch: mutateDocuments,
+  } = useQuery<Array<Document>>({ 
+    queryKey: documentsQueryKey,
+    queryFn: () => fetcher(`/api/document?id=${artifact.documentId}`),
+    enabled: artifact.documentId !== 'init' && artifact.status !== 'streaming',
+  });
 
   const [mode, setMode] = useState<'edit' | 'diff'>('edit');
   const [document, setDocument] = useState<Document | null>(null);
@@ -123,51 +123,87 @@ function PureArtifact({
     mutateDocuments();
   }, [artifact.status, mutateDocuments]);
 
-  const { mutate } = useSWRConfig();
+  const queryClient = useQueryClient();
   const [isContentDirty, setIsContentDirty] = useState(false);
 
+  const { mutate: updateDocument } = useMutation<Array<Document>, Error, string, { previousDocuments: Array<Document> | undefined }>({ 
+    mutationFn: async (updatedContent: string) => {
+      if (!artifact) throw new Error('No artifact available');
+      
+      const response = await fetch(`/api/document?id=${artifact.documentId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: artifact.title,
+          content: updatedContent,
+          kind: artifact.kind,
+        }),
+      });
+      
+      if (!response.ok) throw new Error('Failed to update document');
+      return response.json();
+    },
+    onMutate: async (updatedContent) => {
+      // Cancel any outgoing refetches
+      await queryClient.cancelQueries({ queryKey: documentsQueryKey });
+      
+      // Snapshot the previous value
+      const previousDocuments = queryClient.getQueryData<Array<Document>>(documentsQueryKey);
+      
+      if (previousDocuments) {
+        const currentDocument = previousDocuments.at(-1);
+        
+        if (currentDocument && currentDocument.content !== updatedContent) {
+          // Optimistically update to the new value with a temporary flag
+          const newDocument = {
+            ...currentDocument,
+            content: updatedContent,
+            createdAt: new Date(),
+            optimistic: true, // Flag to identify this is an optimistic update
+          };
+          
+          queryClient.setQueryData(documentsQueryKey, [...previousDocuments, newDocument]);
+        }
+      }
+      
+      setIsContentDirty(false);
+      return { previousDocuments };
+    },
+    onSuccess: (serverDocuments) => {
+      // Replace the optimistic entry with the authoritative server response
+      queryClient.setQueryData(documentsQueryKey, serverDocuments);
+    },
+    onError: (err, newContent, context) => {
+      // If the mutation fails, use the context returned from onMutate to roll back
+      if (context?.previousDocuments) {
+        queryClient.setQueryData(documentsQueryKey, context.previousDocuments);
+      }
+      setIsContentDirty(true);
+    },
+    onSettled: () => {
+      // Always refetch after error or success to ensure our local data is in sync with the server
+      queryClient.invalidateQueries({ queryKey: documentsQueryKey });
+    },
+  });
+  
   const handleContentChange = useCallback(
     (updatedContent: string) => {
       if (!artifact) return;
-
-      mutate<Array<Document>>(
-        `/api/document?id=${artifact.documentId}`,
-        async (currentDocuments) => {
-          if (!currentDocuments) return undefined;
-
-          const currentDocument = currentDocuments.at(-1);
-
-          if (!currentDocument || !currentDocument.content) {
-            setIsContentDirty(false);
-            return currentDocuments;
-          }
-
-          if (currentDocument.content !== updatedContent) {
-            await fetch(`/api/document?id=${artifact.documentId}`, {
-              method: 'POST',
-              body: JSON.stringify({
-                title: artifact.title,
-                content: updatedContent,
-                kind: artifact.kind,
-              }),
-            });
-
-            setIsContentDirty(false);
-
-            const newDocument = {
-              ...currentDocument,
-              content: updatedContent,
-              createdAt: new Date(),
-            };
-
-            return [...currentDocuments, newDocument];
-          }
-          return currentDocuments;
-        },
-        { revalidate: false },
-      );
+      
+      const currentDocuments = queryClient.getQueryData<Array<Document>>(documentsQueryKey);
+      if (!currentDocuments) return;
+      
+      const currentDocument = currentDocuments.at(-1);
+      if (!currentDocument || !currentDocument.content) {
+        setIsContentDirty(false);
+        return;
+      }
+      
+      if (currentDocument.content !== updatedContent) {
+        updateDocument(updatedContent);
+      }
     },
-    [artifact, mutate],
+    [artifact, queryClient, documentsQueryKey, updateDocument],
   );
 
   const debouncedHandleContentChange = useDebounceCallback(
@@ -506,7 +542,7 @@ export const Artifact = memo(PureArtifact, (prevProps, nextProps) => {
   if (prevProps.status !== nextProps.status) return false;
   if (!equal(prevProps.votes, nextProps.votes)) return false;
   if (prevProps.input !== nextProps.input) return false;
-  if (!equal(prevProps.messages, nextProps.messages.length)) return false;
+  if (!equal(prevProps.messages, nextProps.messages)) return false;
   if (prevProps.selectedVisibilityType !== nextProps.selectedVisibilityType)
     return false;
 

@@ -6,16 +6,21 @@ import { Chat } from '@/components/chat';
 import { getChatById, getMessagesByChatId } from '@/lib/db/queries';
 import { DataStreamHandler } from '@/components/data-stream-handler';
 import { DEFAULT_CHAT_MODEL } from '@/lib/ai/models';
-import type { DBMessage } from '@/lib/db/schema';
+import type { Chat as ChatType, DBMessage } from '@/lib/db/schema';
 import type { Attachment, UIMessage } from 'ai';
+import { LocalStorageChatFallback } from '@/components/local-storage-chat-fallback';
 
 export default async function Page(props: { params: Promise<{ id: string }> }) {
   const params = await props.params;
   const { id } = params;
-  const chat = await getChatById({ id });
-
-  if (!chat) {
-    notFound();
+  
+  // Try to get the chat from the server database
+  let chat: ChatType | null = null;
+  try {
+    chat = await getChatById({ id });
+  } catch (error) {
+    // If the chat doesn't exist in the server, we'll check local storage on the client side
+    console.error('Error fetching chat from server:', error);
   }
 
   const session = await auth();
@@ -24,6 +29,12 @@ export default async function Page(props: { params: Promise<{ id: string }> }) {
     redirect('/api/auth/guest');
   }
 
+  // If we don't have a chat from the server, check local storage with our fallback component
+  if (!chat) {
+    return <LocalStorageChatFallback chatId={id} />;
+  }
+  
+  // Check visibility permissions
   if (chat.visibility === 'private') {
     if (!session.user) {
       return notFound();

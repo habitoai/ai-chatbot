@@ -1,5 +1,5 @@
 import type { Message } from 'ai';
-import { useSWRConfig } from 'swr';
+import { useQueryClient, useMutation } from '@tanstack/react-query';
 import { useCopyToClipboard } from 'usehooks-ts';
 
 import type { Vote } from '@/lib/db/schema';
@@ -27,8 +27,118 @@ export function PureMessageActions({
   vote: Vote | undefined;
   isLoading: boolean;
 }) {
-  const { mutate } = useSWRConfig();
+  const queryClient = useQueryClient();
   const [_, copyToClipboard] = useCopyToClipboard();
+  
+  const voteQueryKey = [`/api/vote?chatId=${chatId}`];
+  
+  // Upvote mutation
+  const { mutate: upvoteMutation } = useMutation<Response, Error, void, { previousVotes: Array<Vote> | undefined }>({    
+    mutationFn: () => 
+      fetch('/api/vote', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          chatId,
+          messageId: message.id,
+          type: 'up',
+        }),
+      }),
+    onMutate: async () => {
+      // Cancel any outgoing refetches
+      await queryClient.cancelQueries({ queryKey: voteQueryKey });
+      
+      // Snapshot the previous value
+      const previousVotes = queryClient.getQueryData<Array<Vote>>(voteQueryKey);
+      
+      // Optimistically update to the new value
+      queryClient.setQueryData<Array<Vote>>(voteQueryKey, (currentVotes: Array<Vote> | undefined) => {
+        if (!currentVotes) return [];
+
+        const votesWithoutCurrent = currentVotes.filter(
+          (vote: Vote) => vote.messageId !== message.id,
+        );
+
+        return [
+          ...votesWithoutCurrent,
+          {
+            chatId,
+            messageId: message.id,
+            isUpvoted: true,
+          },
+        ];
+      });
+      
+      return { previousVotes };
+    },
+    onError: (err, variables, context) => {
+      // If the mutation fails, use the context returned from onMutate to roll back
+      if (context?.previousVotes) {
+        queryClient.setQueryData(voteQueryKey, context.previousVotes);
+      }
+      toast.error('Failed to upvote response.');
+    },
+    onSuccess: () => {
+      toast.success('Upvoted Response!');
+    },
+    onSettled: () => {
+      // Always refetch after error or success to ensure our local data is in sync with the server
+      queryClient.invalidateQueries({ queryKey: voteQueryKey });
+    },
+  });
+
+  // Downvote mutation
+  const { mutate: downvoteMutation } = useMutation<Response, Error, void, { previousVotes: Array<Vote> | undefined }>({    
+    mutationFn: () => 
+      fetch('/api/vote', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          chatId,
+          messageId: message.id,
+          type: 'down',
+        }),
+      }),
+    onMutate: async () => {
+      // Cancel any outgoing refetches
+      await queryClient.cancelQueries({ queryKey: voteQueryKey });
+      
+      // Snapshot the previous value
+      const previousVotes = queryClient.getQueryData<Array<Vote>>(voteQueryKey);
+      
+      // Optimistically update to the new value
+      queryClient.setQueryData<Array<Vote>>(voteQueryKey, (currentVotes: Array<Vote> | undefined) => {
+        if (!currentVotes) return [];
+
+        const votesWithoutCurrent = currentVotes.filter(
+          (vote: Vote) => vote.messageId !== message.id,
+        );
+
+        return [
+          ...votesWithoutCurrent,
+          {
+            chatId,
+            messageId: message.id,
+            isUpvoted: false,
+          },
+        ];
+      });
+      
+      return { previousVotes };
+    },
+    onError: (err, variables, context) => {
+      // If the mutation fails, use the context returned from onMutate to roll back
+      if (context?.previousVotes) {
+        queryClient.setQueryData(voteQueryKey, context.previousVotes);
+      }
+      toast.error('Failed to downvote response.');
+    },
+    onSuccess: () => {
+      toast.success('Downvoted Response!');
+    },
+    onSettled: () => {
+      // Always refetch after error or success to ensure our local data is in sync with the server
+      queryClient.invalidateQueries({ queryKey: voteQueryKey });
+    },
+  });
 
   if (isLoading) return null;
   if (message.role === 'user') return null;
@@ -70,44 +180,8 @@ export function PureMessageActions({
               className="py-1 px-2 h-fit text-muted-foreground !pointer-events-auto"
               disabled={vote?.isUpvoted}
               variant="outline"
-              onClick={async () => {
-                const upvote = fetch('/api/vote', {
-                  method: 'PATCH',
-                  body: JSON.stringify({
-                    chatId,
-                    messageId: message.id,
-                    type: 'up',
-                  }),
-                });
-
-                toast.promise(upvote, {
-                  loading: 'Upvoting Response...',
-                  success: () => {
-                    mutate<Array<Vote>>(
-                      `/api/vote?chatId=${chatId}`,
-                      (currentVotes) => {
-                        if (!currentVotes) return [];
-
-                        const votesWithoutCurrent = currentVotes.filter(
-                          (vote) => vote.messageId !== message.id,
-                        );
-
-                        return [
-                          ...votesWithoutCurrent,
-                          {
-                            chatId,
-                            messageId: message.id,
-                            isUpvoted: true,
-                          },
-                        ];
-                      },
-                      { revalidate: false },
-                    );
-
-                    return 'Upvoted Response!';
-                  },
-                  error: 'Failed to upvote response.',
-                });
+              onClick={() => {
+                upvoteMutation();
               }}
             >
               <ThumbUpIcon />
@@ -123,44 +197,8 @@ export function PureMessageActions({
               className="py-1 px-2 h-fit text-muted-foreground !pointer-events-auto"
               variant="outline"
               disabled={vote && !vote.isUpvoted}
-              onClick={async () => {
-                const downvote = fetch('/api/vote', {
-                  method: 'PATCH',
-                  body: JSON.stringify({
-                    chatId,
-                    messageId: message.id,
-                    type: 'down',
-                  }),
-                });
-
-                toast.promise(downvote, {
-                  loading: 'Downvoting Response...',
-                  success: () => {
-                    mutate<Array<Vote>>(
-                      `/api/vote?chatId=${chatId}`,
-                      (currentVotes) => {
-                        if (!currentVotes) return [];
-
-                        const votesWithoutCurrent = currentVotes.filter(
-                          (vote) => vote.messageId !== message.id,
-                        );
-
-                        return [
-                          ...votesWithoutCurrent,
-                          {
-                            chatId,
-                            messageId: message.id,
-                            isUpvoted: false,
-                          },
-                        ];
-                      },
-                      { revalidate: false },
-                    );
-
-                    return 'Downvoted Response!';
-                  },
-                  error: 'Failed to downvote response.',
-                });
+              onClick={() => {
+                downvoteMutation();
               }}
             >
               <ThumbDownIcon />

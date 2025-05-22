@@ -12,8 +12,11 @@ import { ArtifactKind, UIArtifact } from './artifact';
 import { FileIcon, FullscreenIcon, ImageIcon, LoaderIcon } from './icons';
 import { cn, fetcher } from '@/lib/utils';
 import { Document } from '@/lib/db/schema';
+import { getDocumentsById } from '@/lib/db/client/documents';
+import { useLocalStorageContext } from './local-storage-context';
+import { toast } from 'sonner';
 import { InlineDocumentSkeleton } from './document-skeleton';
-import useSWR from 'swr';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Editor } from './text-editor';
 import { DocumentToolCall, DocumentToolResult } from './document';
 import { CodeEditor } from './code-editor';
@@ -34,13 +37,65 @@ export function DocumentPreview({
   args,
 }: DocumentPreviewProps) {
   const { artifact, setArtifact } = useArtifact();
+  const { isInitialized, isOnline, getDocument } = useLocalStorageContext();
+  const queryClient = useQueryClient();
 
-  const { data: documents, isLoading: isDocumentsFetching } = useSWR<
+  const { data: documents, isPending: isDocumentsFetching, error } = useQuery<
     Array<Document>
-  >(result ? `/api/document?id=${result.id}` : null, fetcher);
+  >({
+    queryKey: ['document', result?.id],
+    queryFn: async () => {
+      try {
+        return await fetcher(`/api/document?id=${result.id}`);
+      } catch (error: any) {
+        // Check if the error response indicates we should check local storage
+        if (error.checkLocalStorage && isInitialized) {
+          // Try to get the document from local storage
+          const localDocuments = await getDocumentsById(result.id);
+          
+          if (localDocuments && localDocuments.length > 0) {
+            // If found in local storage, use it and show a notification
+            toast.info('This document was found in local storage but not on the server');
+            return localDocuments;
+          }
+        }
+        // If not found in local storage either, rethrow the error
+        throw error;
+      }
+    },
+    enabled: !!result,
+  });
 
   const previewDocument = useMemo(() => documents?.[0], [documents]);
   const hitboxRef = useRef<HTMLDivElement>(null);
+  
+  // If we're offline and the document isn't found, try to load it from local storage
+  useEffect(() => {
+    if (!isOnline && !documents && result?.id && isInitialized) {
+      // Try to get the document from local storage
+      const loadFromLocalStorage = async () => {
+        try {
+          const localDoc = await getDocument(result.id);
+          if (localDoc) {
+            // If found in local storage, update the UI
+            toast.info('Using document from local storage while offline');
+            // We can't directly update the documents state from React Query,
+            // but we can update the artifact state which is used for rendering
+            setArtifact(current => ({
+              ...current,
+              content: localDoc.content,
+              title: localDoc.title,
+              status: 'idle'
+            }));
+          }
+        } catch (error) {
+          console.error('Error loading document from local storage:', error);
+        }
+      };
+      
+      loadFromLocalStorage();
+    }
+  }, [isOnline, documents, result?.id, isInitialized, getDocument, setArtifact]);
 
   useEffect(() => {
     const boundingBox = hitboxRef.current?.getBoundingClientRect();
@@ -81,7 +136,9 @@ export function DocumentPreview({
   }
 
   if (isDocumentsFetching) {
-    return <LoadingSkeleton artifactKind={result.kind ?? args.kind} />;
+    // Provide a default fallback value for artifactKind if result and args are undefined
+    const artifactKind = (result?.kind || args?.kind || 'text') as ArtifactKind;
+    return <LoadingSkeleton artifactKind={artifactKind} />;
   }
 
   const document: Document | null = previewDocument
@@ -97,7 +154,7 @@ export function DocumentPreview({
         }
       : null;
 
-  if (!document) return <LoadingSkeleton artifactKind={artifact.kind} />;
+  if (!document) return <LoadingSkeleton artifactKind={(artifact?.kind || 'text') as ArtifactKind} />;
 
   return (
     <div className="relative w-full cursor-pointer">

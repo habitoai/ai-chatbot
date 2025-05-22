@@ -199,11 +199,30 @@ export async function getChatsByUserId({
   }
 }
 
-export async function getChatById({ id }: { id: string }) {
+export async function getChatById({ id, userId }: { id: string; userId?: string }) {
   try {
-    const [selectedChat] = await db.select().from(chat).where(eq(chat.id, id));
-    return selectedChat;
+    // If userId is provided, ensure we only return chats owned by this user
+    if (userId) {
+      const [selectedChat] = await db
+        .select()
+        .from(chat)
+        .where(and(eq(chat.id, id), eq(chat.userId, userId)));
+      
+      if (!selectedChat) {
+        throw new ChatSDKError('bad_request:database', 'Chat not found or access denied');
+      }
+      
+      return selectedChat;
+    } else {
+      // This branch should only be used for internal operations, not user-facing APIs
+      // Consider deprecating this path in the future
+      const [selectedChat] = await db.select().from(chat).where(eq(chat.id, id));
+      return selectedChat;
+    }
   } catch (error) {
+    if (error instanceof ChatSDKError) {
+      throw error; // Re-throw ChatSDKError instances
+    }
     throw new ChatSDKError('bad_request:database', 'Failed to get chat by id');
   }
 }
@@ -309,6 +328,12 @@ export async function saveDocument({
 
 export async function getDocumentsById({ id }: { id: string }) {
   try {
+    // Validate the ID parameter
+    if (!id || id === 'undefined') {
+      console.warn('Invalid document ID provided:', id);
+      return [];
+    }
+    
     const documents = await db
       .select()
       .from(document)
@@ -317,6 +342,7 @@ export async function getDocumentsById({ id }: { id: string }) {
 
     return documents;
   } catch (error) {
+    console.error('Database error in getDocumentsById:', error);
     throw new ChatSDKError(
       'bad_request:database',
       'Failed to get documents by id',

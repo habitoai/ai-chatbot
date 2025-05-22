@@ -3,7 +3,7 @@
 import { isToday, isYesterday, subMonths, subWeeks } from 'date-fns';
 import { useParams, useRouter } from 'next/navigation';
 import type { User } from 'next-auth';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { toast } from 'sonner';
 import { motion } from 'framer-motion';
 import {
@@ -25,8 +25,10 @@ import {
 import type { Chat } from '@/lib/db/schema';
 import { fetcher } from '@/lib/utils';
 import { ChatItem } from './sidebar-history-item';
-import useSWRInfinite from 'swr/infinite';
+import { useInfiniteQuery, useQueryClient, useMutation, InfiniteData } from '@tanstack/react-query';
 import { LoaderIcon } from './icons';
+import { useLocalStorageContext } from './local-storage-context';
+import type { LocalChat } from '@/lib/db/client/database';
 
 type GroupedChats = {
   today: Chat[];
@@ -81,73 +83,167 @@ export function getChatHistoryPaginationKey(
   previousPageData: ChatHistory,
 ) {
   if (previousPageData && previousPageData.hasMore === false) {
-    return null;
+    return undefined; // Return undefined instead of null to signal no more pages
   }
 
   if (pageIndex === 0) return `/api/history?limit=${PAGE_SIZE}`;
 
   const firstChatFromPage = previousPageData.chats.at(-1);
 
-  if (!firstChatFromPage) return null;
+  if (!firstChatFromPage) return undefined; // Return undefined instead of null
 
   return `/api/history?ending_before=${firstChatFromPage.id}&limit=${PAGE_SIZE}`;
 }
 
 export function SidebarHistory({ user }: { user: User | undefined }) {
-  const { setOpenMobile } = useSidebar();
-  const { id } = useParams();
+  const router = useRouter();
+  const params = useParams<{ id: string }>();
+  const queryClient = useQueryClient();
+  const { state, setOpenMobile } = useSidebar();
+  const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
+  const [chatToDelete, setChatToDelete] = useState<string | null>(null);
+  const { isOnline, getChats, removeChatAndMessages, isInitialized } = useLocalStorageContext();
+  const [localChats, setLocalChats] = useState<LocalChat[]>([]);
+  
+  // Load local chats when initialized
+  useEffect(() => {
+    if (isInitialized) {
+      getChats().then(setLocalChats).catch(console.error);
+    }
+  }, [isInitialized, getChats]);
+  
+  // Get the current chat ID from params
+  const id = params?.id;
 
   const {
-    data: paginatedChatHistories,
-    setSize,
-    isValidating,
+    data,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
     isLoading,
-    mutate,
-  } = useSWRInfinite<ChatHistory>(getChatHistoryPaginationKey, fetcher, {
-    fallbackData: [],
+    isFetching,
+  } = useInfiniteQuery<ChatHistory, Error, ChatHistory, string[], string | undefined>({
+    queryKey: ['chatHistory'],
+    queryFn: async ({ pageParam }) => {
+      if (!pageParam) throw new Error('No page param'); 
+      return fetcher(pageParam);
+    },
+    initialPageParam: getChatHistoryPaginationKey(0, null as any), 
+    getNextPageParam: (lastPage: ChatHistory, allPages: ChatHistory[]) => { 
+      const lastPageIndex = allPages.length -1;
+      const key = getChatHistoryPaginationKey(lastPageIndex + 1, lastPage);
+      return key ?? undefined; // Return undefined to signal no more pages
+    },
   });
 
-  const router = useRouter();
+  // Explicitly type data as InfiniteData to access pages property
+  const infiniteData = data as InfiniteData<ChatHistory, string | undefined> | undefined;
+  const paginatedChatHistories = infiniteData?.pages;
+  
+  // Combine all chats from all pages and local storage
+  let allChats = infiniteData
+    ? infiniteData.pages.flatMap((page) => page.chats)
+    : [];
+    
+  // If offline or we have local chats, merge them with server chats
+  if (!isOnline || localChats.length > 0) {
+    // Convert LocalChat to Chat format for display
+    const formattedLocalChats = localChats.map(localChat => ({
+      id: localChat.id,
+      title: localChat.title,
+      createdAt: localChat.createdAt,
+      userId: localChat.userId,
+      visibility: localChat.visibility,
+    }));
+    
+    // Merge and deduplicate chats by ID
+    const chatMap = new Map();
+    
+    // Add server chats first
+    allChats.forEach(chat => chatMap.set(chat.id, chat));
+    
+    // Then add local chats (will override server chats with same ID)
+    formattedLocalChats.forEach(chat => chatMap.set(chat.id, chat));
+    
+    // Convert back to array and sort by createdAt (newest first)
+    allChats = Array.from(chatMap.values()).sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+  } 
+
+  const hasEmptyChatHistory = allChats.length === 0 && !isLoading && !isFetchingNextPage;
+
+  const deleteChatMutation = useMutation({
+    mutationFn: async (chatId: string) => {
+      if (!isOnline) {
+        // If offline, just delete from local storage
+        await removeChatAndMessages(chatId);
+        return;
+      }
+      
+      // Otherwise, delete from server
+      await fetch(`/api/chat`, {
+        method: 'DELETE',
+        body: JSON.stringify({ id: chatId }),
+      }).then(response => {
+        if (!response.ok) throw new Error(`Delete failed with ${response.status}`);
+      });
+      
+      // Also delete from local storage to keep in sync
+      await removeChatAndMessages(chatId);
+    },
+    onMutate: async (chatId) => {
+      // Cancel any outgoing refetches
+      await queryClient.cancelQueries({ queryKey: ['chatHistory'] });
+
+      // Snapshot the previous value
+      const previousData = queryClient.getQueryData<InfiniteData<ChatHistory>>(['chatHistory']);
+
+      // Optimistically update to the new value
+      if (previousData) {
+        queryClient.setQueryData<InfiniteData<ChatHistory>>(['chatHistory'], (old) => {
+          if (!old) return { pages: [], pageParams: [] };
+          
+          return {
+            ...old,
+            pages: old.pages.map(page => ({
+              ...page,
+              chats: page.chats.filter(chat => chat.id !== chatId)
+            }))
+          };
+        });
+      }
+      
+      // Also update local chats state
+      setLocalChats(prevChats => prevChats.filter(chat => chat.id !== chatId));
+
+      return { previousData };
+    },
+    onError: (err, variables, context) => {
+      // If the mutation fails, use the context returned from onMutate to roll back
+      if (context?.previousData) {
+        queryClient.setQueryData<InfiniteData<ChatHistory>>(['chatHistory'], context.previousData);
+      }
+      
+      toast.error('Failed to delete chat. Please try again.');
+    },
+    onSettled: () => {
+      // Always refetch after error or success
+      queryClient.invalidateQueries({ queryKey: ['chatHistory'] });
+    }
+  });
+
+  const { mutate: deleteChatMutate, isPending: isDeletingChat } = deleteChatMutation;
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
 
-  const hasReachedEnd = paginatedChatHistories
-    ? paginatedChatHistories.some((page) => page.hasMore === false)
-    : false;
-
-  const hasEmptyChatHistory = paginatedChatHistories
-    ? paginatedChatHistories.every((page) => page.chats.length === 0)
-    : false;
-
   const handleDelete = async () => {
-    const deletePromise = fetch(`/api/chat?id=${deleteId}`, {
-      method: 'DELETE',
-    });
-
-    toast.promise(deletePromise, {
-      loading: 'Deleting chat...',
-      success: () => {
-        mutate((chatHistories) => {
-          if (chatHistories) {
-            return chatHistories.map((chatHistory) => ({
-              ...chatHistory,
-              chats: chatHistory.chats.filter((chat) => chat.id !== deleteId),
-            }));
-          }
-        });
-
-        return 'Chat deleted successfully';
-      },
-      error: 'Failed to delete chat',
-    });
-
-    setShowDeleteDialog(false);
-
-    if (deleteId === id) {
-      router.push('/');
+    if (deleteId) {
+      deleteChatMutate(deleteId);
     }
   };
 
+  // Check if user is logged in
   if (!user) {
     return (
       <SidebarGroup>
@@ -206,138 +302,52 @@ export function SidebarHistory({ user }: { user: User | undefined }) {
       <SidebarGroup>
         <SidebarGroupContent>
           <SidebarMenu>
-            {paginatedChatHistories &&
-              (() => {
-                const chatsFromHistory = paginatedChatHistories.flatMap(
-                  (paginatedChatHistory) => paginatedChatHistory.chats,
-                );
-
-                const groupedChats = groupChatsByDate(chatsFromHistory);
-
-                return (
-                  <div className="flex flex-col gap-6">
-                    {groupedChats.today.length > 0 && (
-                      <div>
-                        <div className="px-2 py-1 text-xs text-sidebar-foreground/50">
-                          Today
-                        </div>
-                        {groupedChats.today.map((chat) => (
-                          <ChatItem
-                            key={chat.id}
-                            chat={chat}
-                            isActive={chat.id === id}
-                            onDelete={(chatId) => {
-                              setDeleteId(chatId);
-                              setShowDeleteDialog(true);
-                            }}
-                            setOpenMobile={setOpenMobile}
-                          />
-                        ))}
+            {paginatedChatHistories && (
+              <div className="flex-1 overflow-y-auto">
+                {Object.entries(groupChatsByDate(allChats)).map(([groupName, chatsInGroup]) => {
+                  if (chatsInGroup.length === 0) return null;
+                  return (
+                    <div key={groupName}>
+                      <div className="px-2 py-1 text-xs text-sidebar-foreground/50">
+                        {groupName.charAt(0).toUpperCase() + groupName.slice(1)}
                       </div>
-                    )}
-
-                    {groupedChats.yesterday.length > 0 && (
-                      <div>
-                        <div className="px-2 py-1 text-xs text-sidebar-foreground/50">
-                          Yesterday
-                        </div>
-                        {groupedChats.yesterday.map((chat) => (
-                          <ChatItem
-                            key={chat.id}
-                            chat={chat}
-                            isActive={chat.id === id}
-                            onDelete={(chatId) => {
-                              setDeleteId(chatId);
-                              setShowDeleteDialog(true);
-                            }}
-                            setOpenMobile={setOpenMobile}
-                          />
-                        ))}
-                      </div>
-                    )}
-
-                    {groupedChats.lastWeek.length > 0 && (
-                      <div>
-                        <div className="px-2 py-1 text-xs text-sidebar-foreground/50">
-                          Last 7 days
-                        </div>
-                        {groupedChats.lastWeek.map((chat) => (
-                          <ChatItem
-                            key={chat.id}
-                            chat={chat}
-                            isActive={chat.id === id}
-                            onDelete={(chatId) => {
-                              setDeleteId(chatId);
-                              setShowDeleteDialog(true);
-                            }}
-                            setOpenMobile={setOpenMobile}
-                          />
-                        ))}
-                      </div>
-                    )}
-
-                    {groupedChats.lastMonth.length > 0 && (
-                      <div>
-                        <div className="px-2 py-1 text-xs text-sidebar-foreground/50">
-                          Last 30 days
-                        </div>
-                        {groupedChats.lastMonth.map((chat) => (
-                          <ChatItem
-                            key={chat.id}
-                            chat={chat}
-                            isActive={chat.id === id}
-                            onDelete={(chatId) => {
-                              setDeleteId(chatId);
-                              setShowDeleteDialog(true);
-                            }}
-                            setOpenMobile={setOpenMobile}
-                          />
-                        ))}
-                      </div>
-                    )}
-
-                    {groupedChats.older.length > 0 && (
-                      <div>
-                        <div className="px-2 py-1 text-xs text-sidebar-foreground/50">
-                          Older than last month
-                        </div>
-                        {groupedChats.older.map((chat) => (
-                          <ChatItem
-                            key={chat.id}
-                            chat={chat}
-                            isActive={chat.id === id}
-                            onDelete={(chatId) => {
-                              setDeleteId(chatId);
-                              setShowDeleteDialog(true);
-                            }}
-                            setOpenMobile={setOpenMobile}
-                          />
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
+                      {chatsInGroup.map((chat: Chat) => ( 
+                        <ChatItem
+                          key={chat.id}
+                          chat={chat}
+                          isActive={chat.id === id}
+                          onDelete={(chatId) => {
+                            setDeleteId(chatId);
+                            setShowDeleteDialog(true);
+                          }}
+                          setOpenMobile={setOpenMobile}
+                        />
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </SidebarMenu>
 
           <motion.div
             onViewportEnter={() => {
-              if (!isValidating && !hasReachedEnd) {
-                setSize((size) => size + 1);
+              if (!isFetching && hasNextPage) {
+                fetchNextPage();
               }
             }}
           />
 
-          {hasReachedEnd ? (
-            <div className="px-2 text-zinc-500 w-full flex flex-row justify-center items-center text-sm gap-2 mt-8">
-              You have reached the end of your chat history.
-            </div>
-          ) : (
+          {hasNextPage ? (
             <div className="p-2 text-zinc-500 dark:text-zinc-400 flex flex-row gap-2 items-center mt-8">
               <div className="animate-spin">
                 <LoaderIcon />
               </div>
               <div>Loading Chats...</div>
+            </div>
+          ) : (
+            <div className="px-2 text-zinc-500 w-full flex flex-row justify-center items-center text-sm gap-2 mt-8">
+              You have reached the end of your chat history.
             </div>
           )}
         </SidebarGroupContent>
