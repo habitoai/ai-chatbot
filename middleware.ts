@@ -13,7 +13,8 @@ export async function middleware(request: NextRequest) {
     return new Response('pong', { status: 200 });
   }
 
-  if (pathname.startsWith('/api/auth')) {
+  // Allow requests to /api/auth and /api/trpc to pass through without token check
+  if (pathname.startsWith('/api/auth') || pathname.startsWith('/api/trpc')) {
     return NextResponse.next();
   }
 
